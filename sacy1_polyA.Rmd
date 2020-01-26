@@ -1,0 +1,1101 @@
+---
+title: "sacy1_polyA.Rmd"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries,eval=T,results='hide',message=FALSE,warning=FALSE}
+library("ggplot2")
+library("magrittr")
+library("dplyr")
+library("magrittr")
+library("rtracklayer")
+library("GenomicFeatures")
+library("GenomicAlignments")
+library("RColorBrewer")
+#library("biomaRt")
+library("DESeq2")
+library("goseq")
+library("ComplexHeatmap")
+library("Gviz")
+library("BSgenome.Celegans.UCSC.ce11")
+ce11<-BSgenome.Celegans.UCSC.ce11
+suppressWarnings(seqlevelsStyle(ce11)<-"Ensembl")
+
+ts<-format(Sys.time(), "%a_%b_%d_%Y_%H%M")
+cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+```
+
+
+```{r define_functions,eval=T}
+gg_plotcounts <- function(x="WBGene00004984",d=cds,returnData=F) {
+  if (substr(x,1,6)=="WBGene") {
+    title<-symbols[grep(x,symbols$gene_id),"gene_name"][1]
+  } else {
+    x<-tolower(x)
+    title<-x
+    x<-symbols[grep(paste0("^",title,"$"),symbols$gene_name),"gene_id"][1]
+  }
+  
+  if(returnData) {return(plotCounts(d,x,intgroup=c("tir1","aid"),returnData=T))}
+  
+  plotCounts(d,x,intgroup=c("tir1","aid"),returnData=T) %>%
+    tibble::rownames_to_column() %>%
+    mutate(aid=as.character(aid)) %>% 
+    mutate(tir1=as.character(tir1)) %>% 
+    mutate(strain=factor(paste0(aid,"_",tir1),levels=c("control_soma","experimental_soma","control_germline","experimental_germline"))) %>% 
+    ggplot(aes(x=strain, y=count,colour=aid,shape=tir1)) +
+    geom_point(position=position_jitter(w=0.1,h=0),size=3) + ggtitle(paste0(title," : ",x)) +
+    stat_summary(fun.y = mean, fun.ymin = mean, fun.ymax = mean,
+                 geom = "crossbar", width = 0.35,size=0.4) +
+    expand_limits(x=0, y = 0) + xlab("") + ylab("Normalized Counts") +
+    scale_color_manual(values=c("#E69F00","#56B4E9")) +
+    theme_bw() + theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+    theme(legend.position="none")
+}
+
+listGO<-function(goid,degs) {
+  #print(go_terms[goid])
+  tg<-wb_go[grep(goid,wb_go$`GO ID`),"ensembl",drop=F]
+  tg$go<-goid
+  idx<-match(tg$ensembl,symbols$gene_id)
+  tg$symbol<-symbols[idx,"gene_name"]
+  tg$deg<-degs[tg$ensembl]
+  as.data.frame(tg[tg$deg==1,])
+}
+
+```
+
+# Make Txdb from GTF file
+```{r generate_txdb,eval=T}
+
+gff3_file<-"data/Caenorhabditis_elegans.WBcel235.97.gtf"
+
+  v97<-import(gff3_file,format="gtf")
+  symbols<-as.data.frame(mcols(v97))
+  symbols<-symbols[symbols$type=="transcript",c("gene_id","gene_name","gene_biotype","transcript_id")]
+  table(symbols$gene_biotype)
+
+  
+#make txdb from gencode BASIC annotatios
+suppressWarnings(txdb<-makeTxDbFromGFF(gff3_file,format="gtf"))
+#seqlevelsStyle(txdb)<-"NCBI"
+exons<-exonsBy(txdb,by="tx",use.names=T)
+exons_per_transcript<-data.frame(num_exons=lengths(exons))
+exons_per_transcript$gene<-symbols[match(rownames(exons_per_transcript),symbols$transcript_id),"gene_id"]
+exons_per_transcript<-exons_per_transcript[with(exons_per_transcript,order(-num_exons)),]
+exons_per_gene<-exons_per_transcript[!duplicated(exons_per_transcript$gene),]
+rownames(exons_per_gene)<-exons_per_gene$gene
+#exons<-exons[!names(exons) %in% symbols[symbols$gene_biotype=='rRNA',]$transcript_id]
+introns<-intronsByTranscript(txdb,use.names=T)
+introns_per_transcript<-data.frame(wid_intron=width(introns))
+colnames(introns_per_transcript)<-c("group_num","transcript_id","width")
+introns_per_transcript<-introns_per_transcript %>% 
+  group_by(transcript_id) %>% 
+  summarize(intron_sum=sum(width),intron_max=max(width)) %>% 
+  ungroup()
+introns_per_transcript$gene<-symbols[match(introns_per_transcript$transcript_id,symbols$transcript_id),"gene_id"]
+introns_per_transcript$gene_name<-symbols[match(introns_per_transcript$transcript_id,symbols$transcript_id),"gene_name"]
+introns_per_transcript<-introns_per_transcript[with(introns_per_transcript,order(-intron_sum)),]
+introns_per_gene<-data.frame(introns_per_transcript[!duplicated(introns_per_transcript$gene),])
+rownames(introns_per_gene)<-introns_per_gene$gene
+
+
+exonsUL<-unlist(exons)
+names(exonsUL)<-exonsUL$exon_name
+
+#transcipts for Gviz
+transcripts<-transcripts(txdb,use.names=TRUE)
+transcripts$gene_id<-symbols[match(transcripts$tx_name,symbols$transcript_id),"gene_id"]
+
+save(symbols,introns_per_gene,exons_per_gene,transcripts,file="symbols97.rdata")
+```
+
+# Load Gene Lists Strome Soma/Germline and OMA1/LIN41 IPs
+```{r load_strome_oma1_lin41_gene_list,eval=T}
+strome<-readxl::read_excel("data/TableS1.xlsx",sheet="H3K9me2 data") %>% dplyr::select(Gene.WB.ID,Gene.Public.Name,`soma-specific`,`germline-specific`) %>% as.data.frame
+length(soma_genes<-strome[strome$`soma-specific`==1,"Gene.WB.ID"])
+length(germline_genes<-strome[strome$`germline-specific`==1,"Gene.WB.ID"])
+
+#oma1/lin41 Enriched list
+rnp_file<-"../lin41/enrichment_relative_to_LysateRZ_withGonadEnrichment_Fri_Apr_21_2017_1638.csv"
+rnp<-read.csv(rnp_file,stringsAsFactors = F,header = T, row.names = 1)
+
+length(lin41_list<-rownames(subset(rnp,Lin.41.IP > 2 & Lin41_padj < 0.05)))
+length(oma1_list<-rownames(subset(rnp,Oma.1.IP > 2 & Oma1_padj < 0.05)))
+```
+
+#DESeq2  
+```{r deseq2,eval=T}
+
+load("featureCounts_SACY1_92_q55_Thu_Aug_15_2019_0844.rdata")
+load("symbols97.rdata")
+
+(coldata<-data.frame(counts=apply(unstranded_counts$counts,2,sum)))
+str(unstranded_counts)
+
+cds<-DESeqDataSetFromMatrix(unstranded_counts$counts,colData = coldata,design = ~1)
+all.equal(rownames(cds),unstranded_counts$annotation$GeneID)
+mcols(cds)$basepairs<-unstranded_counts$annotation$Length
+cds <- estimateSizeFactors(cds)
+cds$filename<-rownames(colData(cds))
+colnames(cds)<- cds$filename %>% gsub("WBcel235\\.","",.) %>% gsub("\\.sort\\.bam\\.repair","",.) %>% gsub("\\.","_rep",.)
+
+cds$strain<-subseq(colnames(cds),1,6)
+cds$rep<-subseq(colnames(cds),8,11)
+
+cds$tir1<-factor(case_when(
+  cds$strain == "CA1352" ~ "germline",
+  cds$strain == "DG4700" ~ "germline",
+  cds$strain == "CA1200" ~ "soma", 
+  cds$strain == "DG4703" ~ "soma",
+))
+
+cds$aid<-factor(case_when(
+  cds$strain == "CA1352" ~ "control",
+  cds$strain == "DG4700" ~ "experimental",
+  cds$strain == "CA1200" ~ "control",
+  cds$strain == "DG4703" ~ "experimental",
+))
+
+cds$group<-factor(paste0(cds$tir1,"_",cds$aid))
+
+
+cds<-cds[,!stringr::str_detect("CA1200_rep2",colnames(cds))]
+as.data.frame(colData(cds))
+  plotPCA(normTransform(cds),intgroup=c("tir1","aid"),returnData=T)
+  
+
+ plotPCA(normTransform(cds),intgroup=c("tir1","aid"),returnData=F,ntop=1000)+
+    scale_color_manual(values=cbPalette[c(6,7,4,2)]) + theme_bw()
+
+#svglite::svglite(file=paste0("2019 Manuscript/pca_",ts,".svg"),width=6,height=4)  
+  plotPCA(normTransform(cds),intgroup=c("tir1","aid"),returnData=F,ntop=1000)+
+    scale_color_manual(values=cbPalette[c(6,7,4,2)]) + theme_bw()
+#dev.off()  
+colData(cds)
+
+gg_plotcounts("tra-2")
+gg_plotcounts("her-1")
+
+```
+
+
+```{r fpkm_table,eval=T}
+f <- fpkm(cds,robust=TRUE)
+
+f_mean <- f %>% as.data.frame() %>% 
+  tibble::rownames_to_column(var="gene_id") %>% 
+  tidyr::gather(sample,fpkm,-gene_id) %>%
+  dplyr::mutate(group=colData(cds)[sample,]$group) %>% 
+  dplyr::group_by(gene_id,group) %>% 
+    dplyr::summarize(mean_fpkm=round(mean(fpkm),3)) %>% 
+    #dplyr::summarize(mean_fpkm=round(log2(mean(fpkm)+0.01),3)) %>% 
+    ungroup() %>% 
+  dplyr::select(gene_id,group,mean_fpkm) %>% 
+  tidyr::spread(group,mean_fpkm) %>%  as.data.frame() 
+
+rownames(f_mean)<-f_mean$gene_id
+f_mean<-f_mean[rownames(cds),-1]
+head(f_mean)
+
+f_mean[unique(symbols[grep("her-1",symbols$gene_name),"gene_id"]),]
+f_mean[unique(symbols[grep("gld-1",symbols$gene_name),"gene_id"]),]
+f_mean[unique(symbols[grep("tra-2",symbols$gene_name),"gene_id"]),]
+```
+
+# Define sets of Differentially expressed genes
+
+```{r generate_results,eval=T}
+colData(cds)
+design(cds)<- ~group
+cds<-DESeq(cds)
+#plotMA(cds,ylim=c(-10,10)) 
+resultsNames(cds)
+```
+
+## Define DEGs in Soma
+```{r degs_soma,eval=T}
+summary(res_soma<-results(cds,contrast=c("group","soma_experimental","soma_control"),alpha=0.05))
+all.equal(rownames(res_soma),rownames(f_mean))
+res_soma<-cbind(as.data.frame(res_soma),f_mean)
+res_soma$gene_name<-symbols[match(rownames(res_soma),symbols$gene_id),"gene_name"]
+res_soma$gene_biotype<-symbols[match(rownames(res_soma),symbols$gene_id),"gene_biotype"]
+
+
+dim(temp_soma<-subset(res_soma, baseMean > 25 & padj<0.05 & abs(log2FoldChange) > 1 &
+                    (germline_control >= 2.5 | germline_experimental >= 2.5 |
+                       soma_control >= 2.5 | soma_experimental >= 2.5 )))
+table(sign(temp_soma$log2FoldChange))
+length(soma_up<-rownames(subset(temp_soma,log2FoldChange > 1)))
+
+
+length(soma_dn<-rownames(subset(temp_soma,log2FoldChange < -1)))
+
+all(c("col-17", "col-41", "col-46", "col-47", "col-90", "col-128", "col-149", "dpy-3", "dpy-4", 
+  "dpy-5", "dpy-6", "dpy-8", "dpy-9", "dpy-13", "dpy-20", "lon-3", "mlt-7", "qua-1", "rol-6", "rol-8", "sqt-1","sqt-2") %in% res_soma[soma_dn,"gene_name"])
+```
+
+
+## Define DEGs in germline
+```{r degs_germline,eval=T}
+  
+summary(res_germ<-results(cds,contrast=c("group","germline_experimental","germline_control"),alpha=0.05))
+stopifnot(all.equal(rownames(res_germ),rownames(f_mean)))
+res_germ<-cbind(as.data.frame(res_germ),f_mean)
+res_germ$gene_name<-symbols[match(rownames(res_germ),symbols$gene_id),"gene_name"]
+res_germ$gene_biotype<-symbols[match(rownames(res_germ),symbols$gene_id),"gene_biotype"]
+
+
+dim(temp_germ<-subset(res_germ, baseMean > 25 & padj<0.05 & abs(log2FoldChange) > 1 &
+                    (germline_control >= 2.5 | germline_experimental >= 2.5 |
+                       soma_control >= 2.5 | soma_experimental >= 2.5 )))
+table(sign(temp_germ$log2FoldChange))
+length(germline_up<-rownames(subset(temp_germ,log2FoldChange > 1)))
+
+res_germ[res_germ$gene_name %in% c("her-1","xol-1","tra-2"),] #sex-determination pathway
+
+length(germline_dn<-rownames(subset(temp_germ,log2FoldChange < -1)))
+```
+
+## Combine soma/germline results for supplementary table
+```{r}
+temp <-full_join(tibble::rownames_to_column(res_soma,var="WormbaseID"),tibble::rownames_to_column(res_germ,var="WormbaseID"),
+                 by=c("WormbaseID","gene_name","gene_biotype","baseMean",
+                 "soma_control","soma_experimental","germline_control","germline_experimental"
+                 ),suffix=c(".soma",".germline")) %>% 
+  dplyr::select(WormbaseID,gene_name,gene_biotype,baseMean,soma_control,soma_experimental,germline_control,germline_experimental,
+                log2FoldChange.soma,padj.soma,log2FoldChange.germline,padj.germline) %>% 
+  dplyr::filter(baseMean > 25 & (germline_control >= 2.5 | germline_experimental >= 2.5 | soma_control >= 2.5 | soma_experimental >= 2.5 )) %>% 
+  dplyr::filter((padj.soma <0.05 & abs(log2FoldChange.soma) > 1) | (padj.germline <0.05 & abs(log2FoldChange.germline) > 1)) %>% 
+  dplyr::arrange(padj.germline) 
+
+#Check it
+stopifnot(all.equal(sort(soma_up),sort(subset(temp,log2FoldChange.soma > 1 & padj.soma < 0.05)$WormbaseID)))
+stopifnot(all.equal(sort(soma_dn),sort(subset(temp,log2FoldChange.soma < -1 & padj.soma < 0.05)$WormbaseID)))
+stopifnot(all.equal(sort(germline_up),sort(subset(temp,log2FoldChange.germline > 1 & padj.germline < 0.05)$WormbaseID)))
+stopifnot(all.equal(sort(germline_dn),sort(subset(temp,log2FoldChange.germline < -1 & padj.germline < 0.05)$WormbaseID)))
+
+#Rename Columns
+  temp2 <- temp %>% 
+  dplyr::rename("Gene Name" = gene_name) %>% 
+  dplyr::rename("Gene Type" = gene_biotype) %>% 
+  dplyr::rename("Mean Counts Across Samples" = baseMean) %>% 
+  dplyr::rename("Soma Control FPKM" = soma_control) %>% 
+  dplyr::rename("Soma Deplete FPKM" = soma_experimental) %>% 
+  dplyr::rename("Germline Control FPKM" = germline_control) %>% 
+  dplyr::rename("Germline Deplete FPKM" = germline_experimental) %>% 
+  dplyr::rename("Log2 Fold Change Soma"= log2FoldChange.soma) %>%
+  dplyr::rename("BH Corrected p-value Soma"= padj.soma) %>%
+  dplyr::rename("Log2 Fold Change Germline"= log2FoldChange.germline) %>%
+  dplyr::rename("BH Corrected p-value Germline"= padj.germline)
+
+
+write.csv(temp2,file=paste0("2019 Manuscript/sacy1_deplete_degs_",ts,".csv"),quote=F,row.names=F)
+```
+
+## Four way Venn on global_results 
+```{r four_way_venn,eval=T}
+
+#svglite::svglite(file=paste0("2019 Manuscript/venn_",ts,".svg"),width=5,height=5)
+grid.newpage()
+VennDiagram::draw.quad.venn(area1=length(germline_up),
+                            area2=length(germline_dn),
+                            area3=length(soma_up),
+                            area4=length(soma_dn),
+                            n12=length(intersect(germline_up,germline_dn)),
+                            n13=length(intersect(germline_up,soma_up)),
+                            n14=length(intersect(germline_up,soma_dn)),
+                            n23=length(intersect(germline_dn,soma_up)),
+                            n24=length(intersect(germline_dn,soma_dn)),
+                            n34=length(intersect(soma_up,soma_dn)),
+                            n123=length(intersect(intersect(germline_up,germline_dn),soma_up)),
+                            n124=length(intersect(intersect(germline_up,germline_dn),soma_dn)),
+                            n134=length(intersect(intersect(germline_up,soma_up),soma_dn)),
+                            n234=length(intersect(intersect(germline_dn,soma_up),soma_dn)),
+                            n1234=length(intersect(intersect(germline_up,germline_dn),intersect(soma_up,soma_dn))),
+                            fill=cbPalette[c(7,6,2,4)],
+                            category=c("germline_up","germline_dn","soma_up","soma_dn"))
+#dev.off()
+
+temp_soma[intersect(soma_up,germline_up),] #17
+temp_soma[intersect(soma_dn,germline_dn),] #8
+
+temp_soma[intersect(soma_up,germline_dn),] #13
+temp_soma[intersect(soma_dn,germline_up),] #1
+
+```
+
+# her-1 and tra-2 bigWig diagrams
+```{r gviz_plots_her1_tra2,eval=T}
+
+options(ucscChromosomeNames=FALSE)
+
+plotTranscript<-function(common_name="her-1",ylim=500,pad=c(100,500),rev=FALSE,logT=FALSE) {
+
+gene<-unique(symbols[grep(common_name,symbols$gene_name),"gene_id"])
+
+gene_start<-start(transcripts[transcripts$gene_id==gene])
+if (length(gene_start) > 1) { gene_start<-min(gene_start) }
+gene_end<-end(transcripts[transcripts$gene_id==gene])
+if (length(gene_end) > 1) { gene_end<-max(gene_end) }
+gene_chr<-unique(as.character(seqnames(transcripts[transcripts$gene_id==gene])))
+
+myImportFun <- function(file, selection){
+  (fls<-list.files("data","*.bam$",full.names=T) %>% stringr::str_subset("CA1352|DG4700"))
+  s_names<-sapply(strsplit(basename(fls),"\\."),function(x) x[1]) %>% gsub("-","_rep",.)
+  weights<-colData(cds[,s_names])$sizeFactor
+  param_total <- ScanBamParam(what="mapq",flag = scanBamFlag(isUnmappedQuery = FALSE,isMinusStrand = NA,isMateMinusStrand = NA,isProperPair = TRUE),which=selection)
+  gr<-GRanges(seqnames=seqnames(selection),IRanges(start=start(selection):end(selection),width=1),strand="*")
+  mcols(gr)<-do.call(cbind,lapply(fls,function(file) as.numeric(coverage(suppressWarnings(GenomicAlignments::readGAlignmentPairs(file,use.names=F,param=param_total)))[[as.character(seqnames(selection))]])[start(selection):end(selection)]))
+  mcols(gr)<-sweep(as.matrix(mcols(gr)),MARGIN=2,weights,"/")
+  return(gr)
+}
+
+
+#myImportFun2("data/DG4700-1.Aligned.out.sort.dedup.unique.bam",GRanges(seqnames=gene_chr,IRanges(start=gene_start,end=gene_end),strand="*"))
+paddedLog2<-function(x) {
+  if(logT) return(log2(x+0.1))
+  else(return(x))
+  }
+gtrack <- GenomeAxisTrack(col="darkgray")
+txTr <- GeneRegionTrack(txdb, chromosome =  gene_chr, start = gene_start-1, end = gene_end+1,fill="gray",col="black",fontcolor.group="black",fill="darkgray",name="WS273 Transcripts")
+dT<-DataTrack(range="data/DG4700-1.Aligned.out.sort.dedup.unique.bam", genome="ce11", type="p", name="Log2 Coverage", chromosome=gene_chr,importFunction = myImportFun,stream=T,col=cbPalette[6:7])
+plotTracks(list(gtrack,dT,txTr), from=gene_start-pad[1], to = gene_end+pad[2],transformation=paddedLog2,reverseStrand=rev,
+           cex=0.8,add53=TRUE,ylim=c(0,ylim),type=c("a","confint"),
+           groups=rep(c("Control", "Deplete"), each=3),
+           col.axis="black",background.title="transparent",fontcolor.title="black") 
+
+}
+
+svglite::svglite(file=paste0("2019 Manuscript/her1_log2_",ts,".svg"),width=5,height=3) 
+plotTranscript("her-1",ylim=10,pad=c(200,500),logT=T,rev=F)
+dev.off()
+
+svglite::svglite(file=paste0("2019 Manuscript/tra2_log2_",ts,".svg"),width=5,height=3) 
+plotTranscript("tra-2",ylim=10,pad=c(25,100),logT=T,rev=T)
+dev.off()
+
+```
+
+# Look at alternative splicing events
+```{r import_rmats,eval=T}
+import_rmats_dataset<-function(dataset) {
+  results<-list()
+  results[["A3SS"]]<-read.table(paste0("rmats/rmats_4.0.2.",dataset,".kimble/A3SS.MATS.JCEC.txt"),stringsAsFactors = F,header=T)[,c("GeneID","geneSymbol","FDR","IncLevelDifference","chr","longExonStart_0base","longExonEnd","IncLevelDifference")]
+  colnames(results[["A3SS"]])<-c("GeneID","geneSymbol","FDR","IncLevelDifference","chr","ExonStart","ExonEnd","IncLevelDifference")
+  results[["A5SS"]]<-read.table(paste0("rmats/rmats_4.0.2.",dataset,".kimble/A5SS.MATS.JCEC.txt"),stringsAsFactors = F,header=T)[,c("GeneID","geneSymbol","FDR","IncLevelDifference","chr","longExonStart_0base","longExonEnd","IncLevelDifference")]
+  colnames(results[["A5SS"]])<-c("GeneID","geneSymbol","FDR","IncLevelDifference","chr","ExonStart","ExonEnd","IncLevelDifference")
+  results[["MXE"]]<-read.table(paste0("rmats/rmats_4.0.2.",dataset,".kimble/MXE.MATS.JCEC.txt"),stringsAsFactors = F,header=T)[,c("GeneID","geneSymbol","FDR","IncLevelDifference","chr","X1stExonStart_0base","X1stExonEnd","IncLevelDifference")]
+  colnames(results[["MXE"]])<-c("GeneID","geneSymbol","FDR","IncLevelDifference","chr","ExonStart","ExonEnd","IncLevelDifference")
+  results[["RI"]]<-read.table(paste0("rmats/rmats_4.0.2.",dataset,".kimble/RI.MATS.JCEC.txt"),stringsAsFactors = F,header=T)[,c("GeneID","geneSymbol","FDR","IncLevelDifference","chr","riExonStart_0base","riExonEnd","IncLevelDifference")]
+  colnames(results[["RI"]])<-c("GeneID","geneSymbol","FDR","IncLevelDifference","chr","ExonStart","ExonEnd","IncLevelDifference")
+  results[["SE"]]<-read.table(paste0("rmats/rmats_4.0.2.",dataset,".kimble/SE.MATS.JCEC.txt"),stringsAsFactors = F,header=T)[,c("GeneID","geneSymbol","FDR","IncLevelDifference","chr","exonStart_0base","exonEnd","IncLevelDifference")]
+  colnames(results[["SE"]])<-c("GeneID","geneSymbol","FDR","IncLevelDifference","chr","ExonStart","ExonEnd","IncLevelDifference")
+  return(bind_rows(results,.id="event"))
+}
+
+rmats_soma<-import_rmats_dataset("soma")
+rmats_soma<-rmats_soma[with(rmats_soma,order(FDR)),] %>%  distinct(event,GeneID,chr,ExonStart,ExonEnd,.keep_all=TRUE) # removes less significant flanking exon hits, eg
+rmats_germline<-import_rmats_dataset("germline")
+rmats_germline<-rmats_germline[with(rmats_germline,order(FDR)),] %>%  distinct(event,GeneID,chr,ExonStart,ExonEnd,.keep_all=TRUE)
+rmats_ortiz<-import_rmats_dataset("ortiz")
+rmats_ortiz<-rmats_ortiz[with(rmats_ortiz,order(FDR)),] %>%  distinct(event,GeneID,chr,ExonStart,ExonEnd,.keep_all=TRUE)
+
+
+
+temp <-full_join(rmats_soma,rmats_germline,by=c("event","GeneID","geneSymbol","chr","ExonStart","ExonEnd"),suffix=c(".soma",".germline"))
+#rmats_results <- left_join(temp,rmats_ortiz,by=c("event","GeneID","geneSymbol","chr","ExonStart","ExonEnd"),suffix=c(".sacy1",".ortiz"))
+rmats_results <- full_join(temp,rmats_ortiz,by=c("event","GeneID","geneSymbol","chr","ExonStart","ExonEnd"),suffix=c(".sacy1",".ortiz"))
+
+head(rmats_results)
+table(rmats_results$sig<-factor(case_when(
+  rmats_results$FDR.germline < 0.05 & rmats_results$FDR.soma < 0.05  ~ "both", 
+  rmats_results$FDR.germline < 0.05 & (rmats_results$FDR.soma >= 0.05 | is.na(rmats_results$FDR.soma)) ~ "germline", 
+  (rmats_results$FDR.germline >= 0.05 | is.na(rmats_results$FDR.germline) ) & rmats_results$FDR.soma < 0.05  ~ "soma", 
+  (rmats_results$FDR.germline >= 0.05 | is.na(rmats_results$FDR.germline) ) & (rmats_results$FDR.soma >= 0.05 | is.na(rmats_results$FDR.soma)) & rmats_results$FDR < 0.05 ~ "Ortiz_sig",
+  (rmats_results$FDR.germline >= 0.05 | is.na(rmats_results$FDR.germline) ) & (rmats_results$FDR.soma >= 0.05 | is.na(rmats_results$FDR.soma)) ~ "notsig"
+)),useNA="always")
+
+nrow(rmats_results<-rmats_results[rmats_results$sig !="notsig",])
+nrow(rmats_results[rmats_results$sig =="both" | rmats_results$sig =="soma",])
+nrow(rmats_results[rmats_results$sig =="both" | rmats_results$sig =="germline",])
+
+table(rmats_results$ortiz_sig<- factor(case_when(
+  (rmats_results$sig == "germline" | rmats_results$sig == "both") & sign(rmats_results$IncLevelDifference.germline) < 0 & sign(rmats_results$IncLevelDifference) > 0 & rmats_results$FDR < 0.05 ~ "Oocyte Enriched",
+  (rmats_results$sig == "germline" | rmats_results$sig == "both") & sign(rmats_results$IncLevelDifference.germline) > 0 & sign(rmats_results$IncLevelDifference) < 0 & rmats_results$FDR < 0.05 ~ "Oocyte Enriched",
+  (rmats_results$sig == "germline" | rmats_results$sig == "both") & sign(rmats_results$IncLevelDifference.germline) < 0 & sign(rmats_results$IncLevelDifference) < 0 & rmats_results$FDR < 0.05 ~ "Sperm Enriched",
+  (rmats_results$sig == "germline" | rmats_results$sig == "both") & sign(rmats_results$IncLevelDifference.germline) > 0 & sign(rmats_results$IncLevelDifference) > 0 & rmats_results$FDR < 0.05 ~ "Sperm Enriched",
+  rmats_results$sig == "soma" & sign(rmats_results$IncLevelDifference.soma) < 0 & sign(rmats_results$IncLevelDifference) > 0 & rmats_results$FDR < 0.05 ~ "Oocyte Enriched",
+  rmats_results$sig == "soma" & sign(rmats_results$IncLevelDifference.soma) > 0 & sign(rmats_results$IncLevelDifference) < 0 & rmats_results$FDR < 0.05 ~ "Oocyte Enriched",
+  rmats_results$sig == "soma" & sign(rmats_results$IncLevelDifference.soma) < 0 & sign(rmats_results$IncLevelDifference) < 0 & rmats_results$FDR < 0.05 ~ "Sperm Enriched",
+  rmats_results$sig == "soma" & sign(rmats_results$IncLevelDifference.soma) > 0 & sign(rmats_results$IncLevelDifference) > 0 & rmats_results$FDR < 0.05 ~ "Sperm Enriched",
+  rmats_results$sig ==  "Ortiz_sig" ~ "TRUE",
+  is.na(rmats_results$FDR) ~ "not sig",
+  TRUE ~ "not sig"
+  )),useNA="always")
+
+#how many in Oritz
+nrow(rmats_results[rmats_results$ortiz_sig =="Sperm Enriched" | rmats_results$ortiz_sig =="Oocyte Enriched" | rmats_results$ortiz_sig=="TRUE",])
+sum(rmats_ortiz$FDR < 0.05)
+
+#Identify overlapping Transcript (Stringtie Merge doesn't always pull the right name from reference annotation)
+get_overlapping_transcripts<-function(gr) { paste(unique(symbols[symbols$gene_id %in% unique(transcripts[subjectHits(findOverlaps(gr,transcripts))]$gene_id),"gene_name"]),collapse=";") }
+rmats_ranges<-GRanges(seqnames=gsub("chr","",rmats_results$chr),IRanges(start=rmats_results$ExonStart,end=rmats_results$ExonEnd),strand="*")
+rmats_results$overlapping_transcript<-"unknown"
+
+rmats_ranges$name<-rmats_results$sig
+export(rmats_ranges,"rmats_ranges.bed")
+for(i in 1:length(rmats_ranges)) {rmats_results$overlapping_transcript[i]<-get_overlapping_transcripts(rmats_ranges[i])}  #non-vectorized slow step
+
+#svglite::svglite(file=paste0("2019 Manuscript/splicing_effects_",ts,".svg"),width=8,height=4) 
+rmats_results %>% 
+  dplyr::filter(sig != "Ortiz_sig") %>%  #remove ortiz data from figure
+  distinct(event,GeneID,overlapping_transcript,.keep_all=TRUE) %>% 
+  dplyr::mutate(event=factor(event,levels=c("A5SS","A3SS","RI","MXE","SE"))) %>% 
+  dplyr::mutate(sig=factor(sig,levels=c("soma","both","germline"))) %>% 
+  dplyr::mutate(ortiz_sig=factor(ortiz_sig,levels=c("Oocyte Enriched","Sperm Enriched","not sig"))) %>% 
+  ggplot(aes(event)) + geom_bar(aes(fill=ortiz_sig),color="black") + facet_grid(~sig) +
+  scale_fill_manual(values=c("magenta","navyblue","gray"),name="Different\nin \nSperm \nvs \nOocyte",) +
+  ylab("Number of Genes Affected") + xlab("") + ggtitle("Genomewide SACY-1 Splicing Effects") + theme_bw() 
+
+#dev.off()
+
+
+temp<-rmats_results %>% 
+  dplyr::mutate(gr=paste0(chr,":",ExonStart,"-",ExonEnd)) %>% 
+  dplyr::select(overlapping_transcript,GeneID,geneSymbol,gr,event,sig,FDR.soma,IncLevelDifference.soma,
+                                      FDR.germline,IncLevelDifference.germline,ortiz_sig,FDR,IncLevelDifference) %>% 
+  dplyr::rename(FDR.ortiz=FDR,IncLevelDifference.ortiz=IncLevelDifference) %>% 
+  dplyr::mutate(sig=factor(sig,levels=c("germline","both","soma","Ortiz_sig"))) %>% 
+  dplyr::mutate(event=factor(event,levels=c("A3SS","A5SS","RI","SE","MXE"))) %>% 
+  arrange(sig,event,FDR.germline,FDR.ortiz) 
+
+temp2<-temp %>% 
+   dplyr::rename("Overlapping Transcript" = overlapping_transcript) %>%
+   dplyr::rename("StringTie Gene ID" = GeneID) %>% 
+   dplyr::rename("StringTie Defined Symbol" = geneSymbol) %>% 
+   dplyr::rename("Affected Exon Coordinates" = gr) %>% 
+   dplyr::rename("Splicing Event Type" = event) %>% 
+   dplyr::rename("Significant Dataset" = sig) %>% 
+   dplyr::rename("False Discovery Rate q-value Soma" = FDR.soma) %>% 
+   dplyr::rename("Inclusion Level Difference Soma" = IncLevelDifference.soma) %>% 
+   dplyr::rename("False Discovery Rate q-value Germline" = FDR.germline) %>% 
+   dplyr::rename("Inclusion Level Difference Germline" = IncLevelDifference.germline) %>% 
+   dplyr::rename("Relative Enrichment Sperm/Oocyte" = ortiz_sig) %>% 
+   dplyr::rename("False Discovery Rate q-value Sperm/Oocyte" = FDR.ortiz) %>% 
+   dplyr::rename("Inclusion Level Difference Sperm/Oocyte" = IncLevelDifference.ortiz)  
+  
+write.csv(temp2,file=paste0("sacy1_alternative_splicing_events_",ts,".csv"),quote=F,row.names=F)
+
+#find out how many unique genes are alternatively spliced in Ortiz dataset
+nrow(rmats_ortiz_subset<-subset(rmats_ortiz,FDR<0.05))
+rmats_ortiz_subset_ranges<-GRanges(seqnames=gsub("chr","",rmats_ortiz_subset$chr),IRanges(start=rmats_ortiz_subset$ExonStart,end=rmats_ortiz_subset$ExonEnd),strand="*")
+rmats_ortiz_subset$overlapping_transcript<-"unknown"
+for(i in 1:length(rmats_ortiz_subset)) {rmats_ortiz_subset$overlapping_transcript[i]<-get_overlapping_transcripts(rmats_ortiz_subset_ranges[i])}
+table(rmats_ortiz_subset$overlapping_transcript)
+#table(rmats_ortiz_subset$geneSymbol,useNA="always")
+
+
+nrow(x<- rmats_ortiz_subset %>%  distinct(GeneID,.keep_all=TRUE) )
+nrow(y<- rmats_results %>%  distinct(GeneID,.keep_all=TRUE) )
+(x[paste(x$GeneID,x$event,x$overlapping_transcript) %in% paste(y$GeneID,y$event,y$overlapping_transcript),])
+(y[paste(y$GeneID,y$event,y$overlapping_transcript) %in% paste(x$GeneID,x$event,x$overlapping_transcript),])
+
+sum(paste(x$GeneID) %in% paste(y$GeneID))
+
+goi<-c("sel-10", "nos-3", "cye-1", "nos-2", "gld-1","cpb-1", "cdk-8", "rde-11", "ptc-1", "ife-3", "lin-54", "egl-45", "eif-3.2", "wdr-4", "taf-10", "picc-1")
+
+#View(rmats_results[rmats_results$overlapping_transcript %in% goi,])
+```
+
+# import counts for sperm/oocyte data for normalization
+```{r deseq2_for_sperm_oocyte_dataset,eval=T}
+load("featureCounts_SACY1_92_with_kimble_q55_Wed_Dec_11_2019_1120.rdata")
+
+(coldata2<-data.frame(counts=apply(unstranded_counts$counts,2,sum)))
+str(unstranded_counts)
+
+cds2<-DESeqDataSetFromMatrix(unstranded_counts$counts,colData = coldata2,design = ~1)
+stopifnot(all.equal(rownames(cds2),unstranded_counts$annotation$GeneID))
+mcols(cds2)$basepairs<-unstranded_counts$annotation$Length
+cds2 <- estimateSizeFactors(cds2)
+cds2$filename<-rownames(colData(cds2))
+colnames(cds2)<- cds2$filename %>% gsub("WBcel235\\.","",.) %>% 
+  gsub("\\.Aligned\\.out","",.) %>% 
+  gsub("\\.\\.\\.kimble\\.\\.","",.) %>% 
+  gsub("\\.q4\\.bam\\.repair","",.) %>% 
+  gsub("\\.sort\\.bam\\.repair","",.) %>% gsub("\\.","_rep",.)
+
+cds2$strain<-sapply(strsplit(colnames(cds2),"_"), function(x) x[1])
+cds2$rep<-sapply(strsplit(colnames(cds2),"_"), function(x) x[2])
+#cds2$strain<-subseq(colnames(cds2),1,6)
+#cds2$rep<-subseq(colnames(cds2),8,11)
+
+cds2$tir1<-factor(case_when(
+  cds2$strain == "CA1352" ~ "germline", 
+  cds2$strain == "DG4700" ~ "germline",
+  cds2$strain == "CA1200" ~ "soma", 
+  cds2$strain == "DG4703" ~ "soma",
+  TRUE ~ "ortiz"
+))
+
+cds2$aid<-factor(case_when(
+  cds2$strain == "CA1352" ~ "control",
+  cds2$strain == "DG4700" ~ "experimental",
+  cds2$strain == "CA1200" ~ "control",
+  cds2$strain == "DG4703" ~ "experimental",
+  TRUE ~ "ortiz"
+))
+
+cds2$group<-paste0(cds2$tir1,"_",cds2$aid)
+# oocytes [fog-2(q71)]
+colData(cds2)[rownames(colData(cds2)) %>% stringr::str_subset("27951|27952|27953|27954|27955|27956|27957|27958"),]$group<-"fog2"
+# sperm [fem-3(q96)] 
+colData(cds2)[rownames(colData(cds2)) %>% stringr::str_subset("27959|27960|27961|27962|27963|27964|27965|27966"),]$group<-"fem3"
+cds2$group<-factor(cds2$group,levels=c("soma_control","soma_experimental","germline_control","germline_experimental","fem3", "fog2"))
+
+cds2<-cds2[,!stringr::str_detect("CA1200_rep2",colnames(cds2))]
+as.data.frame(colData(cds2))
+  plotPCA(normTransform(cds2),intgroup=c("group"),returnData=F)
+```
+
+# make transcript plots with sperm/oocyte data
+```{r transcript_plots_sperm_oocyte,eval=T}
+options(ucscChromosomeNames=FALSE)
+paddedLog2<-function(x) { if(logT) return(log2(x+0.1)) else(return(x)) }
+
+plotTranscript<-function(x="fog-1",ylim=500,pad=c(100,500),rev=FALSE,logT=FALSE) {
+
+if (stringr::str_detect(x,":")) {
+    x<-gsub("-",":",x) %>% gsub(",","",.)
+    gene_chr<-sapply(strsplit(x,":"),function(y) y[1]) %>% gsub("chr","",.)
+    gene_start<-as.numeric(sapply(strsplit(x,":"),function(y) y[2]))
+    gene_end<-as.numeric(sapply(strsplit(x,":"),function(y) y[3]))
+  } else {
+    gene<-unique(symbols[grep(common_name,symbols$gene_name),"gene_id"])
+    gene_start<-start(transcripts[transcripts$gene_id==gene])
+    if (length(gene_start) > 1) { gene_start<-min(gene_start) }
+    gene_end<-end(transcripts[transcripts$gene_id==gene])
+    if (length(gene_end) > 1) { gene_end<-max(gene_end) }
+    gene_chr<-unique(as.character(seqnames(transcripts[transcripts$gene_id==gene])))
+  }
+  
+myImportFun<- function(file, selection){
+  (fls<-list.files("data","*.bam$",full.names=T) %>% stringr::str_subset("CA1200-1|CA1200-3|DG4703|CA1352|DG4700"))
+  s_names<-sapply(strsplit(basename(fls),"\\."),function(x) x[1]) %>% gsub("-","_rep",.)
+  weights<-colData(cds[,s_names])$sizeFactor
+  param_total <- ScanBamParam(what="mapq",flag = scanBamFlag(isUnmappedQuery = FALSE,isMinusStrand = NA,isMateMinusStrand = NA,isProperPair = TRUE),which=selection)
+  gr<-GRanges(seqnames=seqnames(selection),IRanges(start=start(selection):end(selection),width=1),strand="*")
+  mcols(gr)<-do.call(cbind,lapply(fls,function(file) as.numeric(coverage(suppressWarnings(GenomicAlignments::readGAlignmentPairs(file,use.names=F,param=param_total)))[[as.character(seqnames(selection))]])[start(selection):end(selection)]))
+  mcols(gr)<-sweep(as.matrix(mcols(gr)),MARGIN=2,weights,"/")
+  return(gr)
+}
+
+paddedLog2<-function(x) { if(logT) return(log2(x+0.1)) else(return(x)) }
+#myImportFun("data/DG4700-1.Aligned.out.sort.dedup.unique.bam",GRanges(seqnames=gene_chr,IRanges(start=gene_start,end=gene_end),strand="*"))
+gtrack <- GenomeAxisTrack(col="darkgray")
+txTr <- GeneRegionTrack(txdb, chromosome =  gene_chr, start = gene_start-1, end = gene_end+1,fill="gray",col="black",fontcolor.group="black",fill="darkgray",name="WS273 Transcripts")
+dT<-DataTrack(range="data/DG4700-1.Aligned.out.sort.dedup.unique.bam", genome="ce11", type="p", name="Log2 Coverage", chromosome=gene_chr,importFunction = myImportFun,stream=T,col=cbPalette[c(4,6,7,2)])
+
+group_factor=factor(c(rep("Soma Control",2),rep("Germline Control",3),rep("Germline Deplete",3), rep("Soma Deplete",3)),levels=c("Soma Control","Germline Control","Germline Deplete","Soma Deplete"))
+
+
+plotTracks(list(gtrack,dT,txTr), from=gene_start-pad[1], to = gene_end+pad[2],transformation=paddedLog2,reverseStrand=rev,
+           cex=0.8,add53=TRUE,ylim=c(0,ylim),type=c("a","confint"),
+           groups=group_factor,
+           col.axis="black",background.title="transparent",fontcolor.title="black") 
+}
+
+
+plotTranscriptSO<-function(x="fog-1",ylim=500,pad=c(100,500),rev=FALSE,logT=FALSE) {
+
+if (stringr::str_detect(x,":")) {
+    x<-gsub("-",":",x) %>% gsub(",","",.)
+    gene_chr<-sapply(strsplit(x,":"),function(y) y[1]) %>% gsub("chr","",.)
+    gene_start<-as.numeric(sapply(strsplit(x,":"),function(y) y[2]))
+    gene_end<-as.numeric(sapply(strsplit(x,":"),function(y) y[3]))
+  } else {
+    gene<-unique(symbols[grep(common_name,symbols$gene_name),"gene_id"])
+    gene_start<-start(transcripts[transcripts$gene_id==gene])
+    if (length(gene_start) > 1) { gene_start<-min(gene_start) }
+    gene_end<-end(transcripts[transcripts$gene_id==gene])
+    if (length(gene_end) > 1) { gene_end<-max(gene_end) }
+    gene_chr<-unique(as.character(seqnames(transcripts[transcripts$gene_id==gene])))
+  }
+
+myImportFunSO <- function(file, selection){
+  (fls<-list.files("../data","*.bam$",full.names=T) %>% stringr::str_subset("ortiz"))
+  s_names<-sapply(strsplit(basename(fls),"_"),function(x) x[5]) %>% gsub("\\.q4\\.bam","",.)
+  weights<-colData(cds2[,s_names])$sizeFactor
+  group<-as.character(colData(cds2[,s_names])$group)
+  param_total <- ScanBamParam(what="mapq",flag = scanBamFlag(isUnmappedQuery = FALSE,isMinusStrand = NA,isMateMinusStrand = NA,isProperPair = FALSE),which=selection)
+  gr<-GRanges(seqnames=seqnames(selection),IRanges(start=start(selection):end(selection),width=1),strand="*")
+  mcols(gr)<-do.call(cbind,lapply(fls,function(file) as.numeric(coverage(suppressWarnings(GenomicAlignments::readGAlignments(file,use.names=F,param=param_total)))[[as.character(seqnames(selection))]])[start(selection):end(selection)]))
+  mcols(gr)<-sweep(as.matrix(mcols(gr)),MARGIN=2,weights,"/")
+  colnames(mcols(gr))<-group
+  return(gr)
+}
+
+paddedLog2<-function(x) { if(logT) return(log2(x+0.1)) else(return(x)) }
+#x<-myImportFunSO("data/DG4700-1.Aligned.out.sort.dedup.unique.bam",GRanges(seqnames=gene_chr,IRanges(start=gene_start,end=gene_end),strand="*"))
+gtrack <- GenomeAxisTrack(col="darkgray")
+txTr <- GeneRegionTrack(txdb, chromosome =  gene_chr, start = gene_start-1, end = gene_end+1,fill="gray",col="black",fontcolor.group="black",fill="darkgray",name="WS273 Transcripts")
+dT<-DataTrack(range="data/DG4700-1.Aligned.out.sort.dedup.unique.bam", genome="ce11", type="p", name="Log2 Coverage", chromosome=gene_chr,importFunction = myImportFunSO,stream=T,col=cbPalette[c(3,8)])
+plotTracks(list(gtrack,dT,txTr), from=gene_start-pad[1], to = gene_end+pad[2],transformation=paddedLog2,reverseStrand=rev,
+           cex=0.8,add53=TRUE,ylim=c(0,ylim),type=c("a","confint"),
+           groups=factor(rep(c("Sperm [fem-3(q96)]","Oocytes [fog-2(q71)]"), each=8),levels=c("Sperm [fem-3(q96)]","Oocytes [fog-2(q71)]")),
+           col.axis="black",background.title="transparent",fontcolor.title="black") 
+
+}
+
+#plotTranscriptSO("fog-1",ylim=10,pad=c(100,10),logT=T,rev=F)
+#plotTranscriptSO("chrI:3,210,365-3,212,646",ylim=10,pad=c(100,10),logT=T,rev=F)
+#plotTranscript("fog-1",ylim=10,pad=c(100,10),logT=T,rev=F)
+#plotTranscript("chrI:3,210,365-3,212,646",ylim=10,pad=c(100,10),logT=T,rev=F)
+
+#svglite::svglite(file=paste0("2019 Manuscript/ptc1_log2_",ts,".svg"),width=5,height=3) 
+plotTranscript("chrII:7,893,466-7,893,573",ylim=10,pad=c(0,0),logT=T,rev=F)
+#dev.off()
+#svglite::svglite(file=paste0("2019 Manuscript/ptc1_log2_kimble_",ts,".svg"),width=5,height=3) 
+plotTranscriptSO("chrII:7,893,466-7,893,573",ylim=10,pad=c(0,0),logT=T,rev=F)
+#dev.off()
+
+#lin-54
+#svglite::svglite(file=paste0("2019 Manuscript/lin54_log2_",ts,".svg"),width=5,height=3) 
+plotTranscript("chrIV:13,241,150-13,241,500",ylim=10,pad=c(0,0),logT=T,rev=F)
+#dev.off()
+#svglite::svglite(file=paste0("2019 Manuscript/lin54_log2_kimble_",ts,".svg"),width=5,height=3) 
+plotTranscriptSO("chrIV:13,241,150-13,241,500",ylim=10,pad=c(0,0),logT=T,rev=F)
+#dev.off()
+
+#wdr-4
+#svglite::svglite(file=paste0("2019 Manuscript/wdr4_log2_",ts,".svg"),width=5,height=3) 
+plotTranscript("chrIII:6,726,380-6,726,559",ylim=10,pad=c(0,0),logT=T,rev=F)
+#dev.off()
+#svglite::svglite(file=paste0("2019 Manuscript/wdr4_log2_kimble_",ts,".svg"),width=5,height=3) 
+plotTranscriptSO("chrIII:6,726,380-6,726,559",ylim=10,pad=c(0,0),logT=T,rev=F)
+#dev.off()
+
+#C17H12.2
+#svglite::svglite(file=paste0("2019 Manuscript/C17H12_log2_",ts,".svg"),width=5,height=3) 
+plotTranscript("chrIV:6,788,665-6,788,810",ylim=10,pad=c(0,0),logT=T,rev=T)
+#dev.off()
+#svglite::svglite(file=paste0("2019 Manuscript/C17H12_log2_kimble_",ts,".svg"),width=5,height=3) 
+plotTranscriptSO("chrIV:6,788,665-6,788,810",ylim=10,pad=c(0,0),logT=T,rev=T)
+#dev.off()
+
+#tra-2
+plotTranscript("chrII:6,955,397-6,956,404",ylim=10,pad=c(0,0),logT=T,rev=T)
+plotTranscriptSO("chrII:6,955,397-6,956,404",ylim=10,pad=c(0,0),logT=T,rev=T)
+```
+
+# Figures - GO
+```{r download_GO, eval=F}
+#download.file("ftp://ftp.wormbase.org/pub/wormbase/releases/WS273/ONTOLOGY/gene_association.WS273.wb", destfile="gene_association.WS273.wb")
+#download.file("ftp://ftp.wormbase.org/pub/wormbase/releases/WS273/ONTOLOGY/gene_ontology.WS273.obo",destfile= "gene_ontology.WS273.obo")
+
+ga<-readr::read_delim("gene_association.WS273.wb",skip=3,delim="\t",col_names=F)
+#Scan in OBO file to get Biological Process terms
+t1<-readLines("gene_ontology.WS273.obo",n=-1L)
+terms<-list()
+for (i in seq_along(1:length(t1))) {
+  if (t1[i]=="[Term]") {
+    gt<-substr(t1[i+1],5,14)
+    name<-gsub("name: ","",t1[i+2])
+    if (t1[i+3]=="namespace: biological_process") { 
+      #print (paste0(gt,":  ",name)) 
+      terms[[gt]]<-name
+    }
+    }
+}
+go_terms<-unlist(terms)
+head(ga)
+wb_go<-ga[ga$'X5' %in% names(go_terms),c('X2','X5')]
+colnames(wb_go)<-c("ensembl","GO ID")
+dim(wb_go<-as.data.frame(wb_go))
+#remove duplicated entries (possibly from multiple lines of evidence)
+dim(wb_go<-wb_go[!duplicated(wb_go),])
+wb_go.list<-split(wb_go$`GO ID`,wb_go$ensembl)
+#List Terms for a gene
+symbols[grep("sacy-1",symbols$gene_name),]
+go_terms[wb_go.list[["WBGene00019245"]]]
+symbols[grep("lin-41",symbols$gene_name),]
+go_terms[wb_go.list[["WBGene00003026"]]]
+symbols[grep("lin-29",symbols$gene_name),]
+go_terms[wb_go.list[["WBGene00003015"]]]
+#List Genes for a Term
+symbols[symbols$gene_id %in% wb_go[grep("GO:0045138",wb_go$`GO ID`),"ensembl"],]
+
+go_terms["GO:0008150"] #bp category
+wb_go<-wb_go[wb_go$`GO ID`!="GO:0008150",]
+
+save(wb_go,go_terms,file="wb_273_goterms.rdata")
+```
+
+## GO Analysis 
+```{r GO,eval=T}
+load("wb_273_goterms.rdata")
+length(expressed_genes<-rownames(res_soma[res_soma$baseMean > 1,]))
+
+dim(wb_go<-wb_go[wb_go$ensembl %in% expressed_genes,])
+wb_go.list<-split(wb_go$`GO ID`,wb_go$ensembl)
+
+#bias data
+bd<-mcols(cds)$basepairs
+names(bd)<-rownames(cds)
+bd<-bd[names(bd) %in% expressed_genes]
+
+table(degs_germline_up<-as.numeric(expressed_genes %in% germline_up ))
+names(degs_germline_up)<-expressed_genes
+germline_up_GO<-goseq(nullp(degs_germline_up,bias.data=bd),gene2cat=wb_go.list)
+germline_up_GO[1:10,c("category","term","numDEInCat","numInCat","over_represented_pvalue")]
+listGO("GO:0061158",degs_germline_up)
+gg_plotcounts("ccch-2")
+listGO("GO:0051574",degs_germline_up)
+gg_plotcounts("chk-2")
+listGO("GO:0007369",degs_germline_up)
+
+table(degs_germline_dn<-as.numeric(expressed_genes %in% germline_dn))
+names(degs_germline_dn)<-expressed_genes
+germline_dn_GO<-goseq(nullp(degs_germline_dn,bias.data=bd),gene2cat=wb_go.list)
+germline_dn_GO[1:10,c("category","term","numDEInCat","numInCat","over_represented_pvalue")]
+listGO("GO:0031146",degs_germline_dn)
+listGO("GO:0036498",degs_germline_dn)
+
+table(degs_soma_up<-as.numeric(expressed_genes %in% soma_up ))
+names(degs_soma_up)<-expressed_genes
+soma_up_GO<-goseq(nullp(degs_soma_up,bias.data=bd),gene2cat=wb_go.list)
+soma_up_GO[1:10,c("category","term","numDEInCat","numInCat","over_represented_pvalue")]
+listGO("GO:0009408",degs_soma_up)
+listGO("GO:0036498",degs_soma_up)
+
+table(degs_soma_dn<-as.numeric(expressed_genes %in% soma_dn ))
+names(degs_soma_dn)<-expressed_genes
+soma_dn_GO<-goseq(nullp(degs_soma_dn,bias.data=bd),gene2cat=wb_go.list)
+soma_dn_GO[1:10,c("category","term","numDEInCat","numInCat","over_represented_pvalue")]
+listGO("GO:0042338",degs_soma_dn)
+listGO("GO:0070482",degs_soma_dn)
+
+
+g5<-head(soma_dn_GO,10) %>% 
+  dplyr::mutate(term=glue::glue("{term} ({category})")) %>% 
+  dplyr::mutate(term=factor(term,levels=rev(term))) %>%
+  ggplot(aes(x=term,y=-log10(over_represented_pvalue))) +
+  geom_point(color=cbPalette[4],aes(size=numDEInCat)) +
+  scale_radius(limits=c(1,12)) +
+ # geom_bar(stat="identity",fill=cbPalette[8]) + ylim(c(0,10)) +
+  coord_flip() + xlab("") + ggtitle("Soma DN GO Terms") + ylim(0,12) +
+  theme_bw() + theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),aspect.ratio=4/3)
+
+g6<-head(soma_up_GO,10) %>% 
+  dplyr::mutate(term=glue::glue("{term} ({category})")) %>% 
+  dplyr::mutate(term=factor(term,levels=rev(term))) %>%
+  ggplot(aes(x=term,y=-log10(over_represented_pvalue))) +
+  geom_point(color=cbPalette[2],aes(size=numDEInCat)) +
+   scale_radius(limits=c(1,12)) +
+ # geom_bar(stat="identity",fill=cbPalette[8]) + ylim(c(0,10)) +
+  coord_flip() + xlab("") + ggtitle("Soma UP GO Terms") + ylim(0,12) +
+  theme_bw() + theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),aspect.ratio=4/3)
+
+g7<-head(germline_dn_GO,10) %>% 
+  dplyr::mutate(term=glue::glue("{term} ({category})")) %>% 
+  dplyr::mutate(term=factor(term,levels=rev(term))) %>%
+  ggplot(aes(x=term,y=-log10(over_represented_pvalue))) +
+  geom_point(color=cbPalette[6],aes(size=numDEInCat)) +
+   scale_radius(limits=c(1,12)) +
+ # geom_bar(stat="identity",fill=cbPalette[8]) + ylim(c(0,10)) +
+  coord_flip() + xlab("") + ggtitle("Germline DN GO Terms") + ylim(0,12) +
+  theme_bw() + theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),aspect.ratio=4/3)
+
+g8<-head(germline_up_GO,10) %>% 
+  dplyr::mutate(term=glue::glue("{term} ({category})")) %>% 
+  dplyr::mutate(term=factor(term,levels=rev(term))) %>%
+  ggplot(aes(x=term,y=-log10(over_represented_pvalue))) +
+  geom_point(color=cbPalette[7],aes(size=numDEInCat)) +
+   scale_radius(limits=c(1,12)) +
+ # geom_bar(stat="identity",fill=cbPalette[8]) + ylim(c(0,10)) +
+  coord_flip() + xlab("") + ggtitle("Germline UP GO Terms") + ylim(0,12) +
+  theme_bw() + theme(panel.grid.major=element_blank(), panel.grid.minor=element_blank(),aspect.ratio=4/3)
+
+#pdf(paste0("GO_Overlap_",ts,".pdf"),width=3,height=3);
+#gridExtra::grid.arrange(g5,g6,g7,g8,ncol=1)
+#dev.off()
+g5
+g6
+g7
+g8
+
+#svglite::svglite(file=paste0("2019 Manuscript/GO_soma_dn_",ts,".svg"),width=10,height=3); g5; dev.off()
+#svglite::svglite(file=paste0("2019 Manuscript/GO_soma_up_",ts,".svg"),width=10,height=3); g6; dev.off()
+#svglite::svglite(file=paste0("2019 Manuscript/GO_germ_dn_",ts,".svg"),width=10,height=3); g7; dev.off()
+#svglite::svglite(file=paste0("2019 Manuscript/GO_germ_up_",ts,".svg"),width=10,height=3); g8; dev.off()
+```
+
+
+
+#Remake volcano plots with some of the major GO category genes plotted
+```{r volcano_plots_with_GO_highlights,eval=T}
+
+df_germ<-res_germ[res_germ$gene_name %in% c("Y54G2A.36","her-1","hsp-16.41","hsp-70","hsp-16.1","sdz-27","skr-8","xol-1"),]
+(df_germ<-subset(df_germ,abs(log2FoldChange) > 1 & padj < 1e-10))
+
+#svglite::svglite(file=paste0("2019 Manuscript/res_germ_volcano_",ts,".svg"),width=5,height=4)
+res_germ %>% 
+  tibble::rownames_to_column(var = "gene_id") %>%
+  dplyr::filter(!(is.na(padj) | is.na(log2FoldChange)) & baseMean > 25) %>% 
+  mutate(neglog10=-1*log10(padj)) %>% 
+  mutate(cat=case_when(
+    gene_id %in% germline_up ~ "UP",
+    gene_id %in% germline_dn ~ "DN",
+    TRUE ~ "not_sig"  
+  )) %>%
+  ggplot(aes(x=log2FoldChange,y=neglog10,color=cat)) + 
+  scale_color_manual(values=cbPalette[c(6,1,7)]) +
+  geom_point() + ylim(c(0,150)) + xlim(c(-5,5)) +  theme_bw() + 
+  annotate("text",x=df_germ$log2FoldChange,y=(-1*log10(df_germ$padj)),label=df_germ$gene_name) +
+  ggtitle("Gene Expression Changes in Germline Deplete") + ylab("- Log10 Adjusted P-value") + xlab("Log2 Fold Change")
+#dev.off()
+
+df_soma<-res_soma[res_soma$gene_name %in% c("hsp-16.41","hsp-70","hsp-16.1","col-179","pgp-8","gst-24","dpy-9","dpy-8","dpy-20","sqt-1","rol-6"),]
+(df_soma<-subset(df_soma,abs(log2FoldChange) > 1 & padj < 1e-10))
+
+#svglite::svglite(file=paste0("2019 Manuscript/res_soma_volcano_",ts,".svg"),width=5,height=4)
+res_soma %>% 
+  tibble::rownames_to_column(var = "gene_id") %>% 
+  dplyr::filter(!(is.na(padj) | is.na(log2FoldChange)) & baseMean > 25) %>% 
+  mutate(neglog10=-1*log10(padj)) %>% 
+  mutate(cat=case_when(
+    gene_id %in% soma_up ~ "UP",
+    gene_id %in% soma_dn ~ "DN",
+    TRUE ~ "not_sig"  
+  )) %>% 
+  ggplot(aes(x=log2FoldChange,y=neglog10,color=cat)) + 
+  scale_color_manual(values=cbPalette[c(4,1,2)]) +
+  geom_point() + ylim(c(0,150)) + xlim(c(-5,5)) +  theme_bw() + 
+  annotate("text",x=df_soma$log2FoldChange,y=(-1*log10(df_soma$padj)),label=df_soma$gene_name) +
+  ggtitle("Gene Expression Changes in somaline Deplete") + ylab("- Log10 Adjusted P-value") + xlab("Log2 Fold Change")
+#dev.off()
+```
+
+
+#Heatmap from top 5 GO terms
+
+```{r supplemental_heatmap,eval=T}
+nterms<-5
+
+length(go_gois<- unique(c(do.call(rbind,lapply(soma_up_GO[1:nterms,c("category")],listGO,degs_soma_up))$ensembl,
+                   do.call(rbind,lapply(soma_dn_GO[1:nterms,c("category")],listGO,degs_soma_dn))$ensembl,
+                   do.call(rbind,lapply(germline_up_GO[1:nterms,c("category")],listGO,degs_germline_up))$ensembl,
+                   do.call(rbind,lapply(germline_dn_GO[1:nterms,c("category")],listGO,degs_germline_dn))$ensembl)))
+
+
+temp<-as.matrix(t(scale(t(log2(f[go_gois,]+0.1)),center=T,scale=T)))
+rownames(temp)<-symbols[match(rownames(temp),symbols$gene_id),"gene_name"]
+col_fun = circlize::colorRamp2(c(min(temp),0, max(temp)), c("blue","white", "red"))
+
+#svglite::svglite(file=paste0("2019 Manuscript/heatmap_",ts,".svg"),width=3.5,height=10)  
+
+Heatmap(temp[,c(1,2,9,10,11,3:8)], column_title = "GO GOIs", rect_gp = gpar(col = "black", lwd = 0.5),
+                  cluster_rows = TRUE, cluster_columns=FALSE,
+                  row_names_side = "left",col = col_fun, show_heatmap_legend = TRUE)
+#dev.off()  
+```
+
+# Figure 7B etr-1
+## chrII:167,000-168,600
+```{r}
+options(ucscChromosomeNames=FALSE)
+common_name<-"etr-1"
+ gene_chr<-"II"
+ gene_start<-167000
+ gene_end<-168600
+ logT<-TRUE
+ 
+ 
+gene<-unique(symbols[grep(common_name,symbols$gene_name),"gene_id"])
+
+myImportFun<- function(file, selection){
+  (fls<-list.files("data","*.bam$",full.names=T) %>% stringr::str_subset("CA1200-1|CA1200-3|DG4703|CA1352|DG4700"))
+  s_names<-sapply(strsplit(basename(fls),"\\."),function(x) x[1]) %>% gsub("-","_rep",.)
+  weights<-colData(cds[,s_names])$sizeFactor
+  param_total <- ScanBamParam(what="mapq",flag = scanBamFlag(isUnmappedQuery = FALSE,isMinusStrand = NA,isMateMinusStrand = NA,isProperPair = TRUE),which=selection)
+  gr<-GRanges(seqnames=seqnames(selection),IRanges(start=start(selection):end(selection),width=1),strand="*")
+  mcols(gr)<-do.call(cbind,lapply(fls,function(file) as.numeric(coverage(suppressWarnings(GenomicAlignments::readGAlignmentPairs(file,use.names=F,param=param_total)))[[as.character(seqnames(selection))]])[start(selection):end(selection)]))
+  mcols(gr)<-sweep(as.matrix(mcols(gr)),MARGIN=2,weights,"/")
+  return(gr)
+}
+
+#myImportFun("data/DG4700-1.Aligned.out.sort.dedup.unique.bam",GRanges(seqnames=gene_chr,IRanges(start=gene_start,end=gene_end),strand="*"))
+paddedLog2<-function(x) { if(logT) return(log2(x+0.1)) else(return(x)) }
+gtrack <- GenomeAxisTrack(col="darkgray")
+txTr <- GeneRegionTrack(txdb, chromosome =  gene_chr, start = gene_start, end = gene_end,fill="gray",col="black",fontcolor.group="black",fill="darkgray",name="",transcriptAnnotation="transcript")
+length(txTr@range <- txTr@range[stringr::str_detect("T01D1.2m.3|T01D1.2a.5|T01D1.2n.3|T01D1.2l.5",txTr@range$transcript)])
+#symbol(txTr)<-c("T01D1.2a.1","T01D1.2e.5")
+
+dT<-DataTrack(range="data/DG4700-1.Aligned.out.sort.dedup.unique.bam", genome="ce11", type="p", name="Log2 Coverage", chromosome=gene_chr,importFunction = myImportFun,stream=T,col=cbPalette[c(4,6,7,2)])
+
+group_factor=factor(c(rep("Soma Control",2),rep("Germline Control",3),rep("Germline Deplete",3), rep("Soma Deplete",3)),levels=c("Soma Control","Germline Control","Germline Deplete","Soma Deplete"))
+
+
+#svglite::svglite(file=paste0("2019 Manuscript/etr1_log2_",ts,".svg"),width=8,height=3) 
+plotTracks(list(gtrack,dT,txTr), from=gene_start, to=gene_end,transformation=paddedLog2,reverseStrand=FALSE,
+           cex=0.8,add53=TRUE,ylim=c(0,10),type=c("a","confint"),
+           groups=group_factor,
+           col.axis="black",background.title="transparent",fontcolor.title="black") 
+#dev.off()
+```
+
+
+
+#etr-1 zoom for insets
+```{r}
+options(ucscChromosomeNames=FALSE)
+
+common_name<-"etr-1"
+ gene_start<-167880
+ gene_end<-167920
+ logT<-TRUE
+
+
+gene<-unique(symbols[grep(common_name,symbols$gene_name),"gene_id"])
+gene_chr<-unique(as.character(seqnames(transcripts[transcripts$gene_id==gene])))
+
+myImportFun <- function(file, selection){
+  (fls<-list.files("data","*.bam$",full.names=T) %>% stringr::str_subset("CA1200-1|CA1200-3|DG4703|CA1352|DG4700"))
+  s_names<-sapply(strsplit(basename(fls),"\\."),function(x) x[1]) %>% gsub("-","_rep",.)
+  weights<-colData(cds[,s_names])$sizeFactor
+  param_total <- ScanBamParam(what="mapq",flag = scanBamFlag(isUnmappedQuery = FALSE,isMinusStrand = NA,isMateMinusStrand = NA,isProperPair = TRUE),which=selection)
+  gr<-GRanges(seqnames=seqnames(selection),IRanges(start=start(selection):end(selection),width=1),strand="*")
+  mcols(gr)<-do.call(cbind,lapply(fls,function(file) as.numeric(coverage(suppressWarnings(GenomicAlignments::readGAlignmentPairs(file,use.names=F,param=param_total)))[[as.character(seqnames(selection))]])[start(selection):end(selection)]))
+  mcols(gr)<-sweep(as.matrix(mcols(gr)),MARGIN=2,weights,"/")
+  return(gr)
+}
+
+
+#myImportFun("data/DG4700-1.Aligned.out.sort.dedup.unique.bam",GRanges(seqnames=gene_chr,IRanges(start=gene_start,end=gene_end),strand="*"))
+paddedLog2<-function(x) { if(logT) return(log2(x+0.1)) else(return(x)) }
+
+sTrack <- SequenceTrack(ce11,complement=F)
+dT<-DataTrack(range="data/DG4700-1.Aligned.out.sort.dedup.unique.bam", genome="ce11", type="p", name="Log2 Coverage", chromosome=gene_chr,importFunction = myImportFun,stream=T,col=cbPalette[c(4,6,7,2)])
+
+group_factor=factor(c(rep("Soma Control",2),rep("Germline Control",3),rep("Germline Deplete",3), rep("Soma Deplete",3)),levels=c("Soma Control","Germline Control","Germline Deplete","Soma Deplete"))
+
+
+#svglite::svglite(file=paste0("2019 Manuscript/etr1_zoom1_",ts,".svg"),width=3.5,height=3) 
+plotTracks(list(dT,sTrack), from=gene_start, to = gene_end,transformation=paddedLog2,reverseStrand=FALSE,
+           cex=0.4,add53=TRUE,ylim=c(0,10),type=c("a","confint"),
+           groups=group_factor,
+           col.axis="black",background.title="transparent",fontcolor.title="black") 
+#dev.off()
+
+#svglite::svglite(file=paste0("2019 Manuscript/etr1_zoom2_",ts,".svg"),width=3.5,height=3) 
+ gene_start<-168523
+ gene_end<-168563
+ plotTracks(list(dT,sTrack), from=gene_start, to = gene_end,transformation=paddedLog2,reverseStrand=FALSE,
+           cex=0.4,add53=TRUE,ylim=c(0,10),type=c("a","confint"),
+           groups=group_factor,
+           col.axis="black",background.title="transparent",fontcolor.title="black") 
+ #dev.off()
+
+```
+
+
+# Figure 7C prdx-6 (soma RI)
+## Four condition plot for prdx-6
+## chrIV:219,273-221,018
+```{r}
+options(ucscChromosomeNames=FALSE)
+common_name="prdx-6"
+rev=FALSE
+logT=TRUE
+gene<-unique(symbols[grep(common_name,symbols$gene_name),"gene_id"])
+gene_start<-219273
+gene_end<-220990
+pad<-c(0,0)
+gene_chr<-unique(as.character(seqnames(transcripts[transcripts$gene_id==gene])))
+
+myImportFun_prdx6 <- function(file, selection){
+  (fls<-list.files("data","*.bam$",full.names=T) %>% stringr::str_subset("CA1200-1|CA1200-3|DG4703|CA1352|DG4700"))
+  s_names<-sapply(strsplit(basename(fls),"\\."),function(x) x[1]) %>% gsub("-","_rep",.)
+  weights<-colData(cds[,s_names])$sizeFactor
+  param_total <- ScanBamParam(what="mapq",flag = scanBamFlag(isUnmappedQuery = FALSE,isMinusStrand = NA,isMateMinusStrand = NA,isProperPair = TRUE),which=selection)
+  gr<-GRanges(seqnames=seqnames(selection),IRanges(start=start(selection):end(selection),width=1),strand="*")
+  mcols(gr)<-do.call(cbind,lapply(fls,function(file) as.numeric(coverage(suppressWarnings(GenomicAlignments::readGAlignmentPairs(file,use.names=F,param=param_total)))[[as.character(seqnames(selection))]])[start(selection):end(selection)]))
+  mcols(gr)<-sweep(as.matrix(mcols(gr)),MARGIN=2,weights,"/")
+  return(gr)
+}
+
+#myImportFun_prdx6("data/DG4700-1.Aligned.out.sort.dedup.unique.bam",GRanges(seqnames=gene_chr,IRanges(start=gene_start,end=gene_end),strand="*"))
+paddedLog2<-function(x) { if(logT) return(log2(x+0.1)) else(return(x)) }
+gtrack <- GenomeAxisTrack(col="darkgray")
+txTr <- GeneRegionTrack(txdb, chromosome =  gene_chr, start = gene_start-1, end = gene_end+1,fill="gray",col="black",fontcolor.group="black",fill="darkgray",name="WS273 Transcripts")
+dT<-DataTrack(range="data/DG4700-1.Aligned.out.sort.dedup.unique.bam", genome="ce11", type="p", name="Log2 Coverage", chromosome=gene_chr,importFunction = myImportFun_prdx6,stream=T,col=cbPalette[c(4,6,7,2)])
+
+group_factor=factor(c(rep("Soma Control",2),rep("Germline Control",3),rep("Germline Deplete",3), rep("Soma Deplete",3)),levels=c("Soma Control","Germline Control","Germline Deplete","Soma Deplete"))
+
+
+#svglite::svglite(file=paste0("2019 Manuscript/prdx6_log2_",ts,".svg"),width=5,height=3) 
+plotTracks(list(gtrack,dT,txTr), from=gene_start, to = gene_end,transformation=paddedLog2,reverseStrand=FALSE,
+           cex=0.8,add53=TRUE,ylim=c(0,10),type=c("a","confint"),
+           groups=group_factor,
+           col.axis="black",background.title="transparent",fontcolor.title="black") 
+#dev.off()
+```
+
+# Figure 7D lin-28 all reads
+chrI:8,408,476-8,408,526
+```{r}
+options(ucscChromosomeNames=FALSE)
+common_name<-"lin-28"
+ gene_start<-8408480
+ gene_end<-8408520
+ ylim<-1700
+ logT<-FALSE
+ 
+gene<-unique(symbols[grep(common_name,symbols$gene_name),"gene_id"])
+gene_chr<-unique(as.character(seqnames(transcripts[transcripts$gene_id==gene])))
+
+myImportFun_lin28b <- function(file, selection){
+  (fls<-list.files("data","*.bam$",full.names=T) %>% stringr::str_subset("CA1200-1|CA1200-3|DG4703|CA1352|DG4700"))
+  s_names<-sapply(strsplit(basename(fls),"\\."),function(x) x[1]) %>% gsub("-","_rep",.)
+  weights<-colData(cds[,s_names])$sizeFactor
+  param_total <- ScanBamParam(what="mapq",flag = scanBamFlag(isUnmappedQuery = FALSE,isMinusStrand = NA,isMateMinusStrand = NA,isProperPair = TRUE),which=selection)
+  gr<-GRanges(seqnames=seqnames(selection),IRanges(start=start(selection):end(selection),width=1),strand="*")
+  mcols(gr)<-do.call(cbind,lapply(fls,function(file) as.numeric(coverage(suppressWarnings(GenomicAlignments::readGAlignmentPairs(file,use.names=F,param=param_total)))[[as.character(seqnames(selection))]])[start(selection):end(selection)]))
+  mcols(gr)<-sweep(as.matrix(mcols(gr)),MARGIN=2,weights,"/")
+  return(gr)
+}
+
+#myImportFun_lin28b("data/DG4700-1.Aligned.out.sort.dedup.unique.bam",GRanges(seqnames=gene_chr,IRanges(start=gene_start,end=gene_end),strand="*"))
+paddedLog2<-function(x) {
+  if(logT) return(log2(x+0.1))
+  else(return(x))
+  }
+gtrack <- GenomeAxisTrack(col="darkgray")
+sTrack <- SequenceTrack(ce11,complement=T)
+txTr <- GeneRegionTrack(txdb, chromosome =  gene_chr, start = gene_start-1, end = gene_end+1,fill="gray",col="black",fontcolor.group="black",fill="darkgray",name="",transcriptAnnotation="transcript")
+#length(txTr@range <- txTr@range[stringr::str_detect("T01D1.2m.3|T01D1.2a.5|T01D1.2n.3|T01D1.2l.5",txTr@range$transcript)])
+
+
+dT<-DataTrack(range="data/DG4700-1.Aligned.out.sort.dedup.unique.bam", genome="ce11", type="p", name="Log2 Coverage", chromosome=gene_chr,importFunction = myImportFun_lin28b,stream=T,col=cbPalette[c(4,6,7,2)])
+
+group_factor=factor(c(rep("Soma Control",2),rep("Germline Control",3),rep("Germline Deplete",3), rep("Soma Deplete",3)),levels=c("Soma Control","Germline Control","Germline Deplete","Soma Deplete"))
+
+
+#svglite::svglite(file=paste0("2019 Manuscript/lin28_full_log2_",ts,".svg"),width=3.5,height=3) 
+plotTracks(list(gtrack,dT,sTrack,txTr), from=gene_start, to = gene_end,transformation=paddedLog2,reverseStrand=TRUE,
+           cex=0.4,add53=TRUE,ylim=c(0,1700),type=c("a","confint"),
+           groups=group_factor,
+           col.axis="black",background.title="transparent",fontcolor.title="black") 
+#dev.off()
+ 
+```
+
+
+
