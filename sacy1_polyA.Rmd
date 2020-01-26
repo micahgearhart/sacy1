@@ -1,8 +1,11 @@
 ---
 title: "sacy1_polyA.Rmd"
-output: html_document
 editor_options: 
   chunk_output_type: console
+creative_commons: CC BY
+output:
+  md_document:
+    variant: markdown_github
 ---
 
 ```{r setup, include=FALSE}
@@ -18,7 +21,6 @@ library("rtracklayer")
 library("GenomicFeatures")
 library("GenomicAlignments")
 library("RColorBrewer")
-#library("biomaRt")
 library("DESeq2")
 library("goseq")
 library("ComplexHeatmap")
